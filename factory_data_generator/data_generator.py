@@ -15,12 +15,15 @@ class Generator:
     def __init__(self):
         self.logger = Logger().get_logger()
 
-    def run(self):
+    def run(self, urgent_lot_ratio: float = None):
+        """
+        urgent_lot_ratio: 긴급 Lot 비율 (0.0~1.0). None이면 기본값(7.7%) 사용.
+        """
+        self.urgent_lot_ratio = urgent_lot_ratio  # None = default 7.7%
         self.client = MongoClient("mongodb://localhost:27017")
         self.db_name = "plantsim"
         self.db = self.client[self.db_name]
 
-        # 데이터베이스 삭제
         self.client.drop_database(self.db_name)
         self.logger.info(f"'{self.db_name}' Database Deleted.")
 
@@ -64,9 +67,18 @@ class Generator:
         urgent_a_count = 0
         urgent_b_count = 0
 
-        # 🚨 [수정] 총 긴급 Lot 목표 개수 설정
-        URGENT_LOT_GOAL_PER_DEVICE = 10
-        URGENT_LOT_GOAL_TOTAL = 20
+        # 긴급 Lot 비율 설정
+        # 전체 Lot 수: A(49)+B(66)+C(68)+D(75) = 258
+        TOTAL_LOTS = 258
+        if self.urgent_lot_ratio is not None:
+            # 비율에 따라 목표 개수 계산, A/B 각 절반씩 배분
+            target_total = max(2, int(TOTAL_LOTS * self.urgent_lot_ratio))
+            URGENT_LOT_GOAL_PER_DEVICE = target_total // 2
+            URGENT_LOT_GOAL_TOTAL = URGENT_LOT_GOAL_PER_DEVICE * 2
+            self.logger.info(f"Urgent lot ratio: {self.urgent_lot_ratio*100:.1f}% → {URGENT_LOT_GOAL_TOTAL} lots")
+        else:
+            URGENT_LOT_GOAL_PER_DEVICE = 10   # 기본값: 7.7%
+            URGENT_LOT_GOAL_TOTAL = 20
 
         for device_id, processes in lot_counts.items():
             for process_id, count in processes.items():
@@ -178,9 +190,18 @@ class Generator:
 
     def generate_iplt(self):
         plan_manager = DBStorer("iplt")
-        plan_manager.add_entity(IPLT("A", 25000))
-        plan_manager.add_entity(IPLT("B", 20000))
+        # [수정] 긴급 자동 우선 제거: 긴급 device(A,B)의 IPLT를 매우 길게 고정.
+        #   원래값(A=25000, B=20000)은 긴급 lot의 remain_iplt_time을 촉박하게 만들어,
+        #   IPLT 기반 정렬(Action 6~8)이 긴급을 "자동으로" 앞 순위에 올렸다.
+        #   → DRL이 Action 9를 안 써도 긴급이 처리되어 학습 과제가 성립 안 함.
+        #   이제 IPLT를 시뮬레이션 길이(86400)보다 훨씬 크게 설정해 긴급이 절대
+        #   IPLT-촉박이 되지 않게 한다. 그러면 긴급 우선은 오직 Action 9(긴급=-10)
+        #   로만 가능 → DRL이 "긴급 우선 타이밍"을 의식적으로 학습해야 함.
+        BIG_IPLT = 10_000_000  # 사실상 무한대(IPLT 초과/촉박 발생 안 함)
+        plan_manager.add_entity(IPLT("A", BIG_IPLT))
+        plan_manager.add_entity(IPLT("B", BIG_IPLT))
         plan_manager.save_to_db()
+        self.logger.info(f"IPLT (urgent auto-priority disabled): A=B={BIG_IPLT}")
 
 
 

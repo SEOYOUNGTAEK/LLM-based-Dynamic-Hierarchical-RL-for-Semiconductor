@@ -1,0 +1,79 @@
+%
+% hicss-packages.tex
+% HICSS-60 compatible package and layout settings
+% Based on HICSS official formatting guidelines (10pt, Times, two-column, 1-inch margins)
+%
+
+% --- Page geometry ---
+\usepackage[letterpaper,
+            top=1in, bottom=1in,
+            left=1in, right=1in]{geometry}
+
+% --- Two-column layout ---
+\usepackage{multicol}
+\twocolumn
+\setlength{\columnsep}{0.33in}
+
+% --- Fonts ---
+\usepackage{times}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+
+% --- Math ---
+\usepackage{amsmath,amssymb}
+
+% --- Graphics ---
+\usepackage{graphicx}
+\usepackage[table]{xcolor}   % required for \cellcolor in tables
+
+% --- Tables ---
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{tabularx}
+
+% --- Prevent text overflowing column ---
+\emergencystretch=2em
+
+% --- Bibliography (biblatex + bibtex) ---
+\usepackage[backend=bibtex,
+            style=authoryear,
+            sorting=nyt,
+            maxbibnames=6,
+            minbibnames=3,
+            uniquename=false,
+            uniquelist=false]{biblatex}
+
+% --- Hyperlinks (load last) ---
+\usepackage[colorlinks=true,
+            linkcolor=black,
+            citecolor=black,
+            urlcolor=black]{hyperref}
+
+% --- Section title formatting ---
+\usepackage{titlesec}
+\titleformat{\section}{\normalfont\large\bfseries}{\thesection.}{0.5em}{}
+\titleformat{\subsection}{\normalfont\normalsize\bfseries}{\thesubsection}{0.5em}{}
+\titleformat{\subsubsection}{\normalfont\normalsize\itshape}{\thesubsubsection}{0.5em}{}
+
+% --- Caption formatting ---
+\usepackage{caption}
+\captionsetup{font=small, labelfont=bf}
+
+% --- Spacing ---
+\usepackage{setspace}
+\setlength{\parskip}{0pt}
+\setlength{\parindent}{1em}
+
+% --- Figure/table placement ---
+\usepackage{float}
+
+% --- Checkmark / cross symbols ---
+\usepackage{pifont}
+\newcommand{\cmark}{\ding{51}}   % heavy checkmark
+\newcommand{\xmark}{\ding{55}}   % heavy x
+
+% --- Misc ---
+% \usepackage{microtype}  % disabled: causes compile timeout on Overleaf free plan
+\usepackage{enumitem}
+\setlist[itemize]{topsep=2pt, itemsep=1pt}

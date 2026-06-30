@@ -28,3 +28,21 @@ build/
 # Mac OS / Windows files
 .DS_Store
 Thumbs.db
+
+# Virtual environments
+.venv/
+
+# Project-specific outputs (generated at runtime)
+output/
+pickle/
+*.pkl
+*.spp.bak
+
+# Paper master working files
+Paper_master/unpacked_*/
+Paper_master/docx_scripts/
+
+# Large log/output files
+ablation_expand_out.log
+seed7_output*.log
+_phase1_remaining_out.txt

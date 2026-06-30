@@ -9,6 +9,7 @@ import json
 import time
 import pickle
 from datetime import datetime
+from collections import deque
 from utils import NumpyJSONEncoder
 from factory_data_generator.data_generator import Generator
 from result_reporter.chart_generator import ChartGenerator
@@ -23,10 +24,12 @@ from llm_agent import LLMStrategicAnalyst # (이름이 LLMStrategicAnalyst로 �
 #     Init Value    #0
 #####################
 num_episodes = 100
-num_actions = 10 # ✅ (신규) 액션 개수 변수 (DQN/L1과 일치)
+EVAL_START_EPISODE = 70   # 에피소드 81~100은 평가 전용 (학습 없음)
+RANDOM_SEED = 42
+num_actions = 10
 chart_frequency = 10
 performance_frequency = 1
-iteration_log = True
+iteration_log = False
 
 pd.set_option('display.max_columns', None)
 pd.set_option('display.max_rows', None)
@@ -64,8 +67,7 @@ def format_log(array):
     return "\n".join(output_lines)  # 줄바꿈으로 조합
 
 
-def get_action(state, prev_epsilon, mask=None):
-    # 🚨 (수정) mask를 dqn.select_action으로 전달
+def get_action(state, prev_epsilon, mask=None, greedy=False):
     if iteration_log and mask is not None:
         masked_indices = np.where(~mask)[0]
         if len(masked_indices) > 0:
@@ -73,7 +75,7 @@ def get_action(state, prev_epsilon, mask=None):
         else:
             logger.info('[L1 MASKED] No actions currently forbidden (Free policy).')
 
-    action, epsilon = dqn.select_action(state, episode, mask)
+    action, epsilon = dqn.select_action(state, episode, mask, greedy=greedy)
 
     if prev_epsilon != epsilon:
         print('epsilon : ' + str(epsilon))
@@ -118,24 +120,30 @@ def calculate_avg_processing_time(lot_history_df, target_process_id):
     return timing_df['proc_time'].mean()
 
 if __name__ == '__main__':
+    import argparse, random as _random
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--seed', type=int, default=RANDOM_SEED)
+    args = parser.parse_args()
+    RANDOM_SEED = args.seed
+
+    model_type = "Proposed_FullLLM"
     np.set_printoptions(suppress=True, precision=6)
-    version_no = datetime.now().strftime('%Y%m%d_%H%M%S')
-    folder_name = f"output/{version_no}"
-    log_dir = "./" + folder_name
-    plot_dir = log_dir + '/plot/'
-    if not os.path.exists(folder_name):
-        os.makedirs(folder_name)
-    if not os.path.exists(folder_name + f"/pickle"):
-        os.makedirs(folder_name + f"/pickle")
-    if not os.path.exists(folder_name + f"/csv"):
-        os.makedirs(folder_name + f"/csv")
-    if not os.path.exists(folder_name + f"/log"):
-        os.makedirs(folder_name + f"/log")
-    if not os.path.exists(plot_dir):
-        os.makedirs(plot_dir)
+    version_no  = datetime.now().strftime('%Y%m%d_%H%M%S')
+    folder_name = f"output/{version_no}_{model_type}_s{RANDOM_SEED}"
+    log_dir     = "./" + folder_name
+    plot_dir    = log_dir + '/plot/'
+    for d in [folder_name, folder_name+"/pickle", folder_name+"/csv",
+              folder_name+"/log", plot_dir]:
+        os.makedirs(d, exist_ok=True)
+
+    _random.seed(RANDOM_SEED)          # 데이터 생성기 TAT 난수 재현성 확보
+    np.random.seed(RANDOM_SEED)
+    torch.manual_seed(RANDOM_SEED)
 
     logger = Logger(log_dir +'/log/' + version_no + '.log').get_logger()
     logger.info('Episode : ' + str(num_episodes))
+    logger.info(f'Train episodes: 1~{EVAL_START_EPISODE}, Eval episodes: {EVAL_START_EPISODE+1}~{num_episodes}')
+    logger.info(f'Random seed: {RANDOM_SEED}')
     logger.info('Chart Verbose : ' + str(chart_frequency))
     logger.info('Performance Verbose : ' + str(performance_frequency))
     logger.info('Write Iteration Log : ' + str(iteration_log))
@@ -176,11 +184,14 @@ if __name__ == '__main__':
     lot_processing_rewards = []
     priority_rewards = []
     all_episode_results = []
+    all_xai_records = []       # XAI: 에피소드별 LLM 전략 결정 기록
+    all_xai_step_records = []  # XAI: 스텝별 LLM 개입 기록 (엔지니어용)
+    episode_history = deque(maxlen=5)
 
     plt.ion()
     fig, ax = plt.subplots(figsize=(12, 6))
 
-    dqn = RainbowDQN(num_state=21, num_action=num_actions, num_episodes=num_episodes, iteration_log=iteration_log)
+    dqn = RainbowDQN(num_state=21, num_action=num_actions, num_episodes=EVAL_START_EPISODE, iteration_log=iteration_log)
     iteration_cnt = 0
 
     plantsim_manager = PlantsimManager()
@@ -207,6 +218,7 @@ if __name__ == '__main__':
         episode_start_time = time.time()
         logger.info(f"Episode {episode + 1}/{num_episodes} " + " action : " + str(episode))
         plantsim_manager.start_simulation(episode)
+        episode_summary = {}  # 안전 초기화 (performance_frequency > 1인 경우 대비)
         total_reward = 0
         total_target = 0
         total_urgent_lot = 0
@@ -220,6 +232,7 @@ if __name__ == '__main__':
         unique_available_lots_in_episode = set()
         unique_processed_lots_in_episode = set()
 
+        is_eval = (episode >= EVAL_START_EPISODE)
         simTime = 0
         is_first_iteration = True
         # ✅ (신규) 평균 재공(WIP) 계산을 위한 변수 초기화
@@ -254,20 +267,16 @@ if __name__ == '__main__':
                 if simTime > simulation_end_time:
                     break
 
-                # ✅ (신규) Step 1: L1 에이전트를 통한 빠른 제약 조건 확인
+                # Step 1: L1 — 빠른 제약 조건 확인 (XAI: 트리거 이유 포함)
                 state_summary = plantsim_manager.get_state_summary()
-                # Python 룰에 따라 '즉시' 금지된 행동을 가져옵니다.
-                action_mask = safety_agent.get_action_mask(state_summary)
+                action_mask, triggered_rules = safety_agent.get_action_mask_with_reason(state_summary)
 
-
-                # ###################################
-                # ✅ Step 2: Action 결정 (RL 또는 안전 룰)
-                # ###################################
+                # Step 2: Action 결정 (DRL 원본 Q값도 함께 가져옴 → XAI)
                 get_action_start_time = time.time()
-
-                # 2-1. RL 에이전트의 기본 Action 선택
-                action, epsilon = get_action(state, prev_epsilon, action_mask)
-                ACTION_SOURCE = 'RL'  # (이제 RL이 항상 '안전한' 행동만 선택함)
+                action, epsilon, drl_pref, drl_qval, raw_qvals = dqn.select_action(
+                    state, episode, action_mask, greedy=is_eval, return_qvals=True)
+                ACTION_SOURCE = 'RL'
+                prev_epsilon = epsilon
 
 
                 ##################################
@@ -296,12 +305,28 @@ if __name__ == '__main__':
                         break
 
                 get_state_start_time = time.time()
-                # 🚨 [추가] L1 마스킹 발생 시 카운트 및 정책 스위치 카운트
                 current_action = action
                 episode_action_count += 1
-
-                if current_action != last_action:
-                    L1_strategy_switch_count += 1
+                llm_intervened = (action_mask is not None and not action_mask.all())
+                if llm_intervened:
+                    episode_masked_count += 1
+                    # XAI 스텝 기록: LLM 개입이 있었던 스텝만 저장
+                    all_xai_step_records.append({
+                        "episode":       episode + 1,
+                        "simTime":       simTime,
+                        "is_eval":       is_eval,
+                        # DRL 원본 판단
+                        "drl_preferred_action": drl_pref,
+                        "drl_preferred_qval":   round(float(drl_qval), 4),
+                        "drl_top3": [(int(i), round(float(raw_qvals[i]), 4))
+                                     for i in np.argsort(raw_qvals)[::-1][:3]],
+                        # LLM 개입 결과
+                        "final_action":   action,
+                        "llm_overrode":   (drl_pref != action),
+                        "triggered_rules": triggered_rules,
+                        # 상황 컨텍스트
+                        "state_summary":  state_summary,
+                    })
                 last_action = current_action
 
 
@@ -321,12 +346,9 @@ if __name__ == '__main__':
                 if iteration_log:
                     logger.info('state : ' + format_log(state))
                     logger.info('action : ' + str(action))
-                    logger.info('iplt')
-                    logger.info(plantsim_manager.get_iplt_state())
-                    logger.info('output')
-                    logger.info(plantsim_manager.get_output_state())
-                    logger.info('target')
-                    logger.info(plantsim_manager.get_target_state())
+                    logger.info(f'iplt\n{plantsim_manager.iplt_state}')
+                    logger.info(f'output\n{plantsim_manager.output_state}')
+                    logger.info(f'target\n{plantsim_manager.target_state}')
 
                 ##################################
                 #        Calculate Reward        #
@@ -353,9 +375,6 @@ if __name__ == '__main__':
                 unique_available_lots_in_episode.update(available_lot_ids)
                 unique_processed_lots_in_episode.update(processed_lot_ids)
 
-                output_df = plantsim_manager.get_output_state()
-                target_df = plantsim_manager.get_target_state()
-
                 if iteration_log:
                     # ✅ (신규) 비동기 XRL을 위한 데이터 로깅
                     xrl_data = {
@@ -366,21 +385,23 @@ if __name__ == '__main__':
                     }
                     logger.info(f"[XRL_DATA] {json.dumps(xrl_data, cls=NumpyJSONEncoder)}")
 
-                if not is_first_iteration:
-                    dqn.buffer.add((state, action, reward, next_state))
+                if not is_eval:
+                    if not is_first_iteration:
+                        dqn.buffer.add((state, action, reward, next_state))
+                    else:
+                        is_first_iteration = False
+
+                    if len(dqn.buffer.buffer) > batch_size:
+                        loss = dqn.update(batch_size)
+                        losses.append(loss)
+
+                    iteration_cnt = iteration_cnt + 1
+                    if iteration_cnt % update_target_steps == 0:
+                        dqn.target_net.load_state_dict(dqn.act_net.state_dict())
                 else:
                     is_first_iteration = False
 
                 state = next_state
-
-                if len(dqn.buffer.buffer) > batch_size:
-                    loss = dqn.update(batch_size)
-                    losses.append(loss)
-
-                iteration_cnt = iteration_cnt + 1
-                # 일정 주기마다 Target Network 업데이트
-                if iteration_cnt % update_target_steps == 0:
-                    dqn.target_net.load_state_dict(dqn.act_net.state_dict())
 
                 update_network_end_time = time.time()
                 update_network_elapsed_time = update_network_end_time - update_network_start_time
@@ -398,34 +419,16 @@ if __name__ == '__main__':
 
         # chart_frequency 에피소드마다 그래프 업데이트
         if (episode + 1) % chart_frequency == 0 or (episode > num_episodes - 2):
-            fig, ax = plt.subplots(figsize=(12, 6))
-
-            ax.plot(range(1, len(episode_rewards) + 1), episode_rewards, label="Total Reward")
-            ax.plot(range(1, len(production_rewards) + 1), production_rewards, label="Target Reward")
-            ax.plot(range(1, len(risk_reward) + 1), risk_reward, label="IPLT Reward")
-            ax.plot(range(1, len(lot_processing_rewards) + 1), lot_processing_rewards, label="Lot Move")
-            ax.plot(range(1, len(priority_rewards) + 1), priority_rewards, label="Priority Reward")
-
-            ax.set_xlabel("Episodes")
-            ax.set_ylabel("Reward")
-            ax.set_title("Reward Components Over Episodes")
-            ax.legend()
-
-            graph_filename = os.path.join(plot_dir, f"reward_plot_{episode + 1}.png")
-            plt.savefig(graph_filename)  # 파일로 저장!
-
-            plt.figure(figsize=(8, 5))
-            plt.plot(range(1, len(losses) + 1), losses, label='Training Loss', color='blue')
-            plt.xlabel("Episodes")
-            plt.ylabel("Loss")
-            plt.title("Loss Curve Over Episodes")
-            plt.legend()
-            graph_filename = os.path.join(plot_dir, f"loss_plot_{episode + 1}.png")
-            plt.savefig(graph_filename)
-
+            chart_generator = ChartGenerator(plot_dir, condition=model_type,
+                                             eval_start=EVAL_START_EPISODE)
+            # KPI 추세 (논문 핵심 그래프)
+            chart_generator.draw_kpi_trend(all_episode_results, episode)
+            # 수렴 + Loss
+            chart_generator.draw_reward_convergence(episode_rewards, losses, episode)
+            # LLM 거버넌스 활동
+            chart_generator.draw_governance_activity(all_episode_results, episode)
+            # 설비 Gantt
             eqp_history = plantsim_manager.get_value("var_eqp_history")
-
-            chart_generator = ChartGenerator(plot_dir)
             chart_generator.draw_eqp_chart(eqp_history, episode)
 
             lot_history = plantsim_manager.get_value("var_lot_history")
@@ -498,30 +501,40 @@ if __name__ == '__main__':
 
             priority_rate = (total_moved_priority_lots / total_available_priority_lots) * 100 if total_available_priority_lots > 0 else 0
 
-            # ✅ (신규) 해당 에피소드의 모든 결과를 하나의 딕셔너리로 종합
             episode_summary = {
-                'episode': episode + 1,
-                'total_reward': total_reward,
-                'target_reward': total_target,
-                'iplt_reward': total_urgent_lot,  # (기존 risk_reward)
-                'lot_move_reward': total_lot_move,
+                # ── 식별 ──
+                'episode':   episode + 1,
+                'condition': model_type,
+                'is_eval':   is_eval,
+                'seed':      RANDOM_SEED,
+                # ── 핵심 KPI (논문 Table) ──
+                'AVG_ULOT_CYCLE_TIME': avg_ulot_cycle_time,
+                'target_meet_rate':    target_achievement,
+                'iplt_over_count':     int(iplt_exceed),
+                # ── 수렴 추적 ──
+                'total_reward':    total_reward,
                 'priority_reward': total_priority_lot,
-                'total_outputs': result.get('Total Outputs', 0),
-                'iplt_over_count': result.get('IPLT Over', 0),
-                'target_meet_rate': result.get('Target Meet', 0),
-                'avg_wip': avg_wip,
-                'priority_lots_processed': total_moved_priority_lots,  # ✅ [추가] 실제 처리 개수 (e.g. 50)
-                'priority_lots_available': total_available_priority_lots,  # ✅ [추가] 처리 기회 총합 (e.g. 60)
+                # ── LLM 거버넌스 ──
+                'L2_rules_applied_cumul': llm_analyst.L2_strategy_applied_count,
+                'masking_rate': episode_masked_count / max(episode_action_count, 1),
+                # ── 보조 ──
+                'total_outputs':       float(total_production),
                 'priority_process_rate': priority_rate,
-                'AVG_ULOT_CYCLE_TIME': avg_ulot_cycle_time,  # 🚨 [추가] ULot의 평균 총 소요 시간
-                #'T_DELTA_P5_P4': T_DELTA_P5_P4,            # 🚨 처리 시간 변화량 KPI (P5 - P4)
-                'L2_STRATEGY_COUNT': llm_analyst.L2_strategy_applied_count,  # LLM이 규칙을 보낸 총 횟수
-                'POLICY_SWITCH_COUNT': L1_strategy_switch_count,  # 액션이 전환된 총 횟수
-                'TOTAL_ACTION_STEPS': episode_action_count,  # 해당 에피소드의 총 액션 스텝 수
+                'avg_wip':             avg_wip,
+                'total_action_steps':  episode_action_count,
             }
-            L1_strategy_switch_count = 0
             # ✅ (신규) 종합 결과를 메인 리스트에 추가
             all_episode_results.append(episode_summary)
+
+        # ── 중간 저장 (크래시 복구용) ──────────────────────────────
+        # 에피소드마다 CSV 덮어쓰기 → 언제 죽어도 마지막 완료 에피소드까지 보존
+        _interim_df = pd.DataFrame(all_episode_results)
+        _interim_df.to_csv(folder_name + f"/csv/results_{model_type}.csv", index=False)
+        # 10 에피소드마다 DQN 가중치 체크포인트
+        if (episode + 1) % 10 == 0 and not is_eval:
+            dqn.save_checkpoint(folder_name + f"/dqn_ckpt_ep{episode+1}.pt")
+            logger.info(f"[CKPT] DQN checkpoint saved at episode {episode+1}")
+        # ──────────────────────────────────────────────────────────
 
         summary_end_time = time.time()
         summary_elapsed_time = summary_end_time - summary_start_time
@@ -533,32 +546,25 @@ if __name__ == '__main__':
         if iteration_log:
             logger.info(
                 'episode elapsed time : ' + str(elapsed_time) + ' total reward : ' + str(total_reward) + ' production : ' + str(total_target) + ' exceed : ' + str(total_urgent_lot) + ' lot_move : ' + str(total_lot_move))
-            # ####################################################
-            # ✅ (신규) L2 전략 계층 호출 (에피소드 종료 후 1회)
-            # ####################################################
+
+        # L2 전략 계층 호출 — 평가 에피소드에서는 규칙 고정
+        episode_history.append(episode_summary)
+        if not is_eval:
             logger.info(f"[L2] Episode {episode + 1} finished. Requesting strategic analysis...")
             try:
-                # L2 LLM에게 이번 에피소드 성과('result')와 현재 룰을 전달
-                # safety_agent.current_rules는 List[SafetyRule] 입니다.
-                # analyze_and_update_rules는 List[SafetyRule]를 반환합니다.
-                new_rules = llm_analyst.analyze_and_update_rules(
+                new_rules, xai_rec = llm_analyst.analyze_and_update_rules(
                     episode_results=episode_summary,
-                    previous_rules=safety_agent.current_rules
+                    previous_rules=safety_agent.current_rules,
+                    episode_history=list(episode_history)
                 )
-                logger.info(f"[L2] Received {len(new_rules)} new rules.")
-                for rule in new_rules:
-                    logger.info(f"[L2 RULE] {rule.model_dump_json(indent=2)}")
-                # ⬇️ (수정) '.get("rules")' 호출을 제거! ⬇️
-                # new_rules는 이미 List[SafetyRule]입니다.
+                logger.info(f"[L2] Received {len(new_rules)} rules. Reasoning: {xai_rec.get('reasoning','')[:80]}")
                 safety_agent.set_rules(new_rules)
-
-                # ⬇️ (수정) 'safety_weight' 관련 로직 제거 (L1에서 이미 1.0으로 처리 중) ⬇️
-                logger.info(f"[L2] Strategy updated. New rules: {new_rules}")
-
+                all_xai_records.append(xai_rec)
             except Exception as e:
-                # ⬇️ (수정) 오류 로깅 시 스택 트레이스 포함 ⬇️
                 logger.error(f"[L2] Failed to update strategy.", exc_info=True)
-                logger.info("Using previous settings.")  # (로그 추가)
+                logger.info("Using previous settings.")
+        else:
+            logger.info(f"[EVAL] Episode {episode + 1} is evaluation mode. L2 rules frozen.")
 
     # df = pd.DataFrame({
     #     "episode_rewards": episode_rewards,
@@ -575,6 +581,19 @@ if __name__ == '__main__':
     # CSV 파일 저장
     # ✅ (수정) df -> results_df
     results_df.to_csv(folder_name + f"/csv/rewards_data.csv", index=False)
+    # XAI 데이터 저장
+    import json as _json
+    # XAI 1: 에피소드 수준 전략 결정 (LLM 추론 포함)
+    xai_path = folder_name + "/csv/xai_decisions.json"
+    with open(xai_path, "w", encoding="utf-8") as _f:
+        _json.dump(all_xai_records, _f, ensure_ascii=False, indent=2, default=str)
+    logger.info(f"XAI episode decisions saved: {xai_path} ({len(all_xai_records)} records)")
+    # XAI 2: 스텝 수준 개입 기록 (엔지니어 XAI — DRL Q값 vs LLM 오버라이드)
+    xai_step_path = folder_name + "/csv/xai_step_interventions.json"
+    with open(xai_step_path, "w", encoding="utf-8") as _f:
+        _json.dump(all_xai_step_records, _f, ensure_ascii=False, indent=2, default=str)
+    logger.info(f"XAI step interventions saved: {xai_step_path} ({len(all_xai_step_records)} records)")
+    results_df.to_csv(folder_name + f"/csv/results_{model_type}.csv", index=False)
 
     logger.info(f"get state : {total_get_state_elapsed_time:.4f}")
     logger.info(f"get action : {total_get_action_elapsed_time:.4f}")

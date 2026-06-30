@@ -1,14 +1,31 @@
 import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use('Agg')
 import pandas as pd
 import numpy as np
 import json
 import re
 from collections import deque
 import os
+from result_reporter.paper_visualizer import draw_kpi_trend, draw_reward_convergence, draw_governance_activity
+
+
 class ChartGenerator:
 
-    def __init__(self, plot_dir):
+    def __init__(self, plot_dir, condition='Unknown', eval_start=70):
         self.plot_dir = plot_dir
+        self.condition = condition
+        self.eval_start = eval_start
+
+    # ── Paper-quality charts (위임) ──────────────────────────────
+    def draw_kpi_trend(self, all_results, episode):
+        draw_kpi_trend(all_results, self.eval_start, self.plot_dir, episode, self.condition)
+
+    def draw_reward_convergence(self, rewards, losses, episode):
+        draw_reward_convergence(rewards, losses, self.eval_start, self.plot_dir, episode, self.condition)
+
+    def draw_governance_activity(self, all_results, episode):
+        draw_governance_activity(all_results, self.eval_start, self.plot_dir, episode, self.condition)
     def draw_eqp_chart(self, dic, episode=0):
         # 1️⃣ 잘못된 연속된 따옴표 제거
         fixed_string = re.sub(r',]', ']', dic)

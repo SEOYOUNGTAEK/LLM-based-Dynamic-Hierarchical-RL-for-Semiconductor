@@ -119,33 +119,62 @@ class PlantsimManager:
         # print(f"create_state 실행 시간: {time.time() - create_state:.4f} 초")
         return state
 
-    def get_state_summary(self):
+    def get_state_summary(self) -> str:
         """
-        L1 Safety Agent가 룰을 적용하는 데 필요한
-        '실시간' 메트릭을 계산하여 '문자열'로 반환합니다.
-        (simple_safety_agent._parse_state_summary가 파싱할 수 있는 형태여야 함)
+        L1 Safety Agent용 실시간 메트릭 3개를 문자열로 반환합니다.
+        - urgent_priority_lot_count: Process 5 버퍼의 긴급 Lot 수
+        - production_shortage_pct:   생산 부족률 (%)
+        - iplt_over_lot_count:       IPLT 초과 Lot 수
         """
-
-        # 1. 'urgent_priority_lot_count' 계산
-        # (get_state()가 이미 self.lot_state를 갱신했다고 가정)
+        # 1. urgent_priority_lot_count
         try:
-            # 버퍼(process_id 5, IN_BUFFER)에 있는 Prio 1000 이상 Lot 개수
             priority_count = self.lot_state[
-                (self.lot_state["is_urgent_lotid"]) & # ⬅️ [수정] Lot ID 기반 식별
+                (self.lot_state["is_urgent_lotid"]) &
                 (self.lot_state["process_id"] == 5) &
                 (self.lot_state["state"] == "IN_BUFFER")
-                ].shape[0]
+            ].shape[0]
         except Exception:
-            priority_count = 0  # self.lot_state가 비어있을 경우
+            priority_count = 0
 
-        # 2. L1 에이전트가 파싱할 수 있는 형식의 문자열 생성
-        # (참고: simple_safety_agent._parse_state_summary의 정규식과 일치해야 함)
-        summary_str = f"urgent_priority_lot_count (Priority=1, ID starts with U): {priority_count}" # ⬅️ [수정] 출력 텍스트
+        # 2. production_shortage_pct (시간 보정)
+        # 기존: (target - output) / target * 100
+        #   → 시뮬레이션 초반 output≈0 이라 항상 ~98% → 룰 오발동
+        # 수정: 현재 시간까지 기대 생산량 대비 실제 부족률
+        #   → 실제로 생산이 뒤처질 때만 양수가 됨
+        # SIMULATION_END_TIME: 하루 = 86400초 (twin 전체에서 동일하게 사용)
+        try:
+            total_target = self.target_state["mat_qty"].sum()
+            total_output = self.output_state["qty"].sum()
+            if total_target > 0:
+                sim_time_for_shortage = self.get_sim_time()
+                SIMULATION_END_TIME = 86400.0
+                time_ratio = min(1.0, max(0.0, sim_time_for_shortage / SIMULATION_END_TIME))
+                expected_output = total_target * time_ratio
+                shortage_pct = max(0.0, (expected_output - total_output) / total_target * 100)
+            else:
+                shortage_pct = 0.0
+        except Exception:
+            shortage_pct = 0.0
 
-        # (향후 'iplt_over_count' 같은 다른 메트릭도 여기에 추가할 수 있음)
-        # summary_str += f"\n total_iplt_exceeded_count: {iplt_count}"
+        # 3. iplt_over_lot_count
+        try:
+            sim_time = self.get_sim_time()
+            iplt_time_map = self.iplt_state.set_index("device_id")["iplt_time"].to_dict()
+            lot_with_iplt = self.lot_state.copy()
+            lot_with_iplt["iplt_time"] = lot_with_iplt["device_id"].map(iplt_time_map).fillna(0)
+            lot_with_iplt["actual_iplt"] = sim_time - lot_with_iplt["dest_step_tkout_time"]
+            iplt_over_count = int(
+                ((lot_with_iplt["iplt_time"] > 0) &
+                 (lot_with_iplt["actual_iplt"] > lot_with_iplt["iplt_time"])).sum()
+            )
+        except Exception:
+            iplt_over_count = 0
 
-        return summary_str
+        return (
+            f"urgent_priority_lot_count (Priority=1, ID starts with U): {priority_count}\n"
+            f"production_shortage_pct (target-output/target, %): {shortage_pct:.2f}\n"
+            f"iplt_over_lot_count (exceeded IPLT threshold): {iplt_over_count}"
+        )
 
     def normalization(self, data, max_val=None):
         if max_val is None:
@@ -242,13 +271,12 @@ class PlantsimManager:
         iplt_vector = normalized_exceeded_stats.values.flatten()
         urgent_lot_vector = self.normalization(urgent_lot_vector) # (정규화)
 
+        # [복원] 상태 21차원 — urgent_lot_vector(긴급 4차원) 포함(자연스러운 환경).
+        #   17차원(긴급 제거)은 sparse 강제용 임시 hack이었으나, 긴급이 쉬웠던 진짜
+        #   원인은 IPLT 자동 우선이었음(generate_iplt 수정). 이제 자연 상태로 복원하고
+        #   IPLT 수정 하나만 적용해 깨끗하게 비교한다.
         state_vector = np.concatenate([normalized_sim_time, lot_state_vector, shortage_vector, iplt_vector, urgent_lot_vector]).flatten()
 
-        # print(f"Step 4 실행 시간: {time.time() - step4_start:.4f} 초")
-
-        # print(f"⏱ 전체 실행 시간: {time.time() - start_time:.4f} 초")
-        if self.iteration_log:
-            self.logger.info(f'[DRL STATE] Urgent Lot Vector (Normalized): {state_vector[-4:]}')
         return state_vector, iplt_state_df.reset_index()
 
     def get_target_state(self, is_twin=False):
@@ -858,15 +886,14 @@ class PlantsimManager:
         priority_lot_reward, moved_priority_count, available_priority_count, \
             available_lot_ids, processed_lot_ids = self.calculate_priority_lot_reward()
 
-
-        # ✅ (수정) 최종 Reward에 'priority_lot_reward' 추가
+        # Pure DRL과 동일한 보상 구조 유지 (90% 제약은 LLM 거버넌스가 담당)
         reward = target_reward + lot_move_reward + urgent_lot_reward + priority_lot_reward
 
         reward_components = {
             "target_reward": target_reward,
             "lot_move_reward": lot_move_reward,
-            "urgent_lot_reward": urgent_lot_reward,  # 가중치 적용 전 원본
-            "priority_lot_reward": priority_lot_reward  # ⬅️ (신규)
+            "urgent_lot_reward": urgent_lot_reward,
+            "priority_lot_reward": priority_lot_reward
         }
 
         if iteration_log:
@@ -950,20 +977,21 @@ class PlantsimManager:
             elif available_count > 0:
                 self.logger.warning(f"[REWARD_DEBUG] ❗️경고: 처리 기회({available_count}개)가 있었으나, 처리된 Lot이 0개입니다.")
 
-        # 6. [보상] 처리 성공 시 1개당 +200점
+        # 6. [보상] 긴급 lot 처리 성공 시에만 1개당 +50점 (SPARSE)
         priority_reward = processed_count * 50.0
 
-        # 7. '지연 페널티' 계산
-        priority_penalty = max(unprocessed_count * -10.0, -200.0)  # 페널티 -10점, 최대 -200으로 유지
+        # 7. '지연 페널티' 계산 (원래값 복원: -10/step, 최대 -200)
+        #   긴급 lot이 P5에 미처리 상태로 대기하면 스텝당 -10. 긴급 자동 우선이
+        #   제거된 지금은 DRL이 Action 9를 적절히 써야 이 페널티를 피할 수 있어,
+        #   "긴급 우선 타이밍 학습"의 동기가 된다(자연스러운 보상 구조).
+        priority_penalty = max(unprocessed_count * -10.0, -200.0)
 
         # --- ❗️[디버깅 로그 4] ---
         if self.iteration_log:
-            self.logger.info(f"[REWARD_DEBUG] 3. 리워드 계산:")
-            self.logger.info(f"[REWARD_DEBUG]    보상 (Success): {processed_count} * 200.0 = {priority_reward}")
-            self.logger.info(
-                f"[REWARD_DEBUG]    페널티 (Delay): {unprocessed_count} * -10.0 = {priority_penalty} (Max -200)")
+            self.logger.info(f"[REWARD_DEBUG] 3. 리워드 계산 (SPARSE, no penalty):")
+            self.logger.info(f"[REWARD_DEBUG]    보상 (Success): {processed_count} * 50.0 = {priority_reward}")
 
-        # 8. 최종 리워드 = 보상 + 페널티
+        # 8. 최종 리워드 = 보상만 (sparse)
         total_priority_reward = priority_reward + priority_penalty
 
         # --- ❗️[디버깅 로그 5] ---
@@ -976,10 +1004,12 @@ class PlantsimManager:
         # ✅ 1. 목표 생산량 달성 보상 (device별로 계산)
         prev_shortage = self.prev_target_state["mat_qty"] - self.prev_output_state["qty"]
         current_shortage = self.target_state["mat_qty"] - self.output_state["qty"]
-        # ✅ 부족량 감소한 만큼 보상
-        #target_reward = np.sum(prev_shortage - current_shortage) / 2000.0  # 보상 크기 조정 #일단 바꿈.. 이상해 이거 ㅋㅋㅋ + 타겟보너스도 이상하다 ㅎㅎ
-        target_reward = np.sum(
-            prev_shortage - current_shortage) / 200.0 # 일시적으로 바꿈 SYT ㅋㅋ LLM 보려고
+        # ✅ 부족량(목표-생산)이 감소한 만큼 생산 보상 지급
+        # [확정] 스케일 divisor = 200.0
+        #   생산 보상(dense)과 긴급 보상(priority_lot, +50/lot) 간 균형을 위해 200으로 확정.
+        #   (모든 실험이 이 값으로 수행됨 — 변경 금지)
+        TARGET_REWARD_SCALE = 200.0
+        target_reward = np.sum(prev_shortage - current_shortage) / TARGET_REWARD_SCALE
         # ✅ 2. 목표 생산량 100% 달성 시 추가 보상
         #goal_bonus = 3  # 기본값
         # ✅ 목표를 달성한 device 찾기

@@ -1,6 +1,6 @@
 import re
 import numpy as np
-from typing import List, Dict, Any, Literal, Annotated, Optional
+from typing import List, Dict, Any, Literal, Annotated, Optional, Union
 from logger import Logger
 from pydantic import BaseModel, Field
 
@@ -9,14 +9,21 @@ from pydantic import BaseModel, Field
 class SafetyRule(BaseModel):
     """
     L1에 적용될 안전 룰의 Pydantic 모델.
-    'metric'을 'urgent_priority_lot_count'로만 제한합니다.
+    L2(llm_agent.py)의 SafetyRule과 동일한 3개 메트릭을 지원한다.
+    (L1은 _parse_state_summary에서 3개 메트릭을 모두 파싱하므로,
+     타입 정의도 L2와 일치시켜 정합성을 맞춘다.)
     """
 
-    # ✅ (수정) 'metric'을 'urgent_priority_lot_count' 하나로만 제한
-    metric: Literal["urgent_priority_lot_count"] = Field(...)
+    # ✅ (수정) L2와 동일하게 3개 메트릭 지원
+    metric: Literal[
+        "urgent_priority_lot_count",    # Process 5 버퍼의 긴급 Lot 수
+        "production_shortage_pct",      # 생산 부족률 (시간 보정 %)
+        "iplt_over_lot_count"           # IPLT 초과 Lot 수
+    ] = Field(...)
 
     operator: Literal[">=", ">", "<=", "<", "=="] = Field(...)
-    threshold: int
+    # ✅ (수정) shortage_pct는 소수점 가능 → L2와 동일하게 Union 허용
+    threshold: Union[float, int]
 
     # ✅ (수정) 0~9까지 허용
     forbidden_actions: List[Annotated[int, Field(ge=0, le=9)]] = Field(
@@ -43,67 +50,82 @@ class SimpleSafetyAgent:
         if new_rules:
             self.L2_strategy_applied_count += 1
 
-    # 🚨 '_parse_state_summary' 함수를 아래 코드로 덮어쓰세요.
-    def _parse_state_summary(self, state_summary: str) -> Dict[str, int]:
+    def _parse_state_summary(self, state_summary: str) -> Dict[str, float]:
         """
-        state_summary 텍스트를 파싱하여 'urgent_priority_lot_count'만 추출합니다.
+        state_summary 텍스트를 파싱하여 3개 메트릭을 추출합니다.
+        - urgent_priority_lot_count  (int)
+        - production_shortage_pct    (float)
+        - iplt_over_lot_count        (int)
         """
         try:
-            # 시뮬레이션 텍스트에서 '긴급 물량 개수' 뒤에 적힌 숫자를 찾아 정수로 저장하되, 없으면 0으로 해라
-            priority_match = re.search(r"urgent_priority_lot_count \(Priority=1, ID starts with U\): (\d+)", state_summary)
-            priority_count = int(priority_match.group(1)) if priority_match else 0
+            priority_match = re.search(
+                r"urgent_priority_lot_count.*?: (\d+)", state_summary)
+            shortage_match = re.search(
+                r"production_shortage_pct.*?: ([\d.]+)", state_summary)
+            iplt_match = re.search(
+                r"iplt_over_lot_count.*?: (\d+)", state_summary)
 
             return {
-                "urgent_priority_lot_count": priority_count  # ✅ 'priority'만 반환
+                "urgent_priority_lot_count": int(priority_match.group(1)) if priority_match else 0,
+                "production_shortage_pct":   float(shortage_match.group(1)) if shortage_match else 0.0,
+                "iplt_over_lot_count":       int(iplt_match.group(1)) if iplt_match else 0,
             }
         except Exception as e:
-            self.logger.warning(f"Failed to parse state_summary: {e}. Summary: {state_summary[:50]}...")
-            return {"urgent_priority_lot_count": 0}
+            self.logger.warning(f"Failed to parse state_summary: {e}. Summary: {state_summary[:80]}...")
+            return {"urgent_priority_lot_count": 0, "production_shortage_pct": 0.0, "iplt_over_lot_count": 0}
 
-    # 🚨 (수정) get_action_mask 함수 (더 간결하게)
     def get_action_mask(self, state_summary: str) -> np.ndarray:
+        """L2 룰 기반 Action Mask 생성."""
+        mask, _ = self.get_action_mask_with_reason(state_summary)
+        return mask
+
+    def get_action_mask_with_reason(self, state_summary: str):
         """
-        Pydantic 룰('urgent_priority_lot_count' 기준)을 기반으로 마스크를 생성합니다.
+        Action Mask + XAI용 트리거 이유를 함께 반환합니다.
+        Returns: (mask: np.ndarray, triggered_rules: list[dict])
+        triggered_rules 예시:
+          [{"metric": "urgent_priority_lot_count", "value": 2,
+            "operator": ">=", "threshold": 1,
+            "forbidden_actions": [0,1,2,3,4,5,6,7,8],
+            "reason": "urgent_priority_lot_count(2) >= 1"}]
         """
         mask = np.ones(self.num_actions, dtype=bool)
         state_metrics = self._parse_state_summary(state_summary)
+        triggered_rules = []
 
-        # 'urgent_priority_lot_count' 값 하나만 가져옴
-        metric_value = state_metrics.get("urgent_priority_lot_count", 0)
-
-        # L1 안전 계층(SimpleSafetyAgent)의 핵심 로직 : 상위 계층(L2)에서 전달받은 전략적 규칙을 바탕으로 강화학습 에이전트의 행동을 실시간으로 제한하는 액션 마스킹(Action Masking) 과정을 수행
         for rule in self.current_rules:
             try:
-                # ✅상위 계층의 전략적 의도와 하위 계층의 실행 사이를 연결하는 스위치
-                if rule.metric != "urgent_priority_lot_count":
-                    continue
+                metric_value = state_metrics.get(rule.metric, 0)
+                op = rule.operator
+                th = rule.threshold
 
-                is_triggered = False
-                operator = rule.operator
-                threshold = rule.threshold
-
-                if (operator == "==" and metric_value == threshold):
-                    is_triggered = True
-                elif (operator == ">=" and metric_value >= threshold):
-                    is_triggered = True
-                elif (operator == ">" and metric_value > threshold):
-                    is_triggered = True
-                elif (operator == "<=" and metric_value <= threshold):
-                    is_triggered = True
-                elif (operator == "<" and metric_value < threshold):
-                    is_triggered = True
+                is_triggered = (
+                    (op == "==" and metric_value == th) or
+                    (op == ">=" and metric_value >= th) or
+                    (op == ">"  and metric_value >  th) or
+                    (op == "<=" and metric_value <= th) or
+                    (op == "<"  and metric_value <  th)
+                )
 
                 if is_triggered:
-                    for forbidden_action_index in rule.forbidden_actions:
-                        if 0 <= forbidden_action_index < self.num_actions:
-                            mask[forbidden_action_index] = False
-                            self.logger.warning(
-                                f"[L1 Safety Mask] Rule triggered: "
-                                f"{rule.metric} ({metric_value}) {operator} {threshold}. "
-                                f"Action {forbidden_action_index} is MASKED."
-                            )
+                    for idx in rule.forbidden_actions:
+                        if 0 <= idx < self.num_actions:
+                            mask[idx] = False
+
+                    triggered_rules.append({
+                        "metric":          rule.metric,
+                        "value":           metric_value,
+                        "operator":        op,
+                        "threshold":       th,
+                        "forbidden_actions": rule.forbidden_actions,
+                        "reason": f"{rule.metric}({metric_value:.2f}) {op} {th}",
+                    })
+                    self.logger.warning(
+                        f"[L1] Rule triggered: {rule.metric}({metric_value:.2f}) {op} {th} "
+                        f"→ forbid {rule.forbidden_actions}"
+                    )
 
             except Exception as e:
-                self.logger.error(f"[L1 Safety Mask] Failed to process rule: {rule.model_dump_json()}", exc_info=True)
+                self.logger.error(f"[L1] Rule processing failed: {rule.model_dump_json()}", exc_info=True)
 
-        return mask
+        return mask, triggered_rules

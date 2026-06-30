@@ -180,24 +180,49 @@ class RainbowDQN:
                     1.0 - self.beta_start) / self.beta_frames)
         self.frame_idx = 0  # 총 스텝 카운터 (update 함수에서 증가)
 
-    # ... (select_action 함수 동일) ...
-    def select_action(self, state, current_episode, mask=None):
-        # ✅ [수정] mask=None 인수를 받습니다.
+    def select_action(self, state, current_episode, mask=None, greedy=False, return_qvals=False):
+        state_tensor = torch.tensor(state, dtype=torch.float).unsqueeze(0).to(self.device)
 
-        state = torch.tensor(state, dtype=torch.float).unsqueeze(0).to(self.device)
-        self.act_net.reset_noise()
-        value = self.act_net(state)
+        # Eval 모드: NoisyNet 노이즈 비활성화 → 결정론적 Q값
+        if greedy:
+            self.act_net.eval()
+            with torch.no_grad():
+                value = self.act_net(state_tensor)
+            self.act_net.train()
+        else:
+            self.act_net.reset_noise()
+            value = self.act_net(state_tensor)
 
-        # --- L1 마스킹 적용 (학습된 행동) ---
+        # XAI: 마스킹 전 DRL 원본 Q값/선호 액션 저장
+        raw_qvals = value.detach().cpu().numpy().flatten()
+        drl_preferred_action = int(np.argmax(raw_qvals))
+        drl_preferred_qval   = float(raw_qvals[drl_preferred_action])
+
+        # L1 Action Masking
+        masked_value = value.clone()
         if mask is not None:
-            # L1이 금지한 행동(False)에 대해 -infinity 값을 주어 선택되지 않도록 함
-            mask_tensor = torch.tensor(mask, dtype=torch.bool).to(self.device)
-            value.masked_fill_(~mask_tensor, -float('inf'))
+            # 룰 충돌로 전체 action이 금지된 경우 → mask 무시하고 DRL Q값으로 선택
+            if not mask.any():
+                self.logger.warning(
+                    "[L1 Safety] All actions masked (rule conflict)! "
+                    "Ignoring mask and selecting best Q-value action."
+                )
+            else:
+                mask_tensor = torch.tensor(mask, dtype=torch.bool).to(self.device)
+                masked_value.masked_fill_(~mask_tensor, -float('inf'))
 
-        action = torch.argmax(value).item()
+        action = torch.argmax(masked_value).item()
         action_type = 'rl'
 
-        # --- Epsilon 계산 ---
+        # Greedy eval: epsilon=0, 탐색 없음
+        if greedy:
+            if self.iteration_log:
+                self.logger.info(f'action : {action} type : greedy epsilon : 0.0000')
+            if return_qvals:
+                return action, 0.0, drl_preferred_action, drl_preferred_qval, raw_qvals
+            return action, 0.0
+
+        # Epsilon 계산 (훈련 에피소드 기준)
         transition_episode = int(self.num_episodes * (1 / 3))
         decay_rate = 5.0
 
@@ -207,31 +232,28 @@ class RainbowDQN:
             progress = (current_episode - transition_episode) / (self.num_episodes - transition_episode)
             self.epsilon = max(self.epsilon_min, self.epsilon_start * np.exp(-decay_rate * progress))
 
-        # --- L1 마스킹 적용 (무작위 탐색) ---
+        # Epsilon-greedy 탐색 (허용된 액션 내에서만)
         if np.random.rand() < self.epsilon:
             action_type = 'random'
-
-            # ✅ [수정] 전체 10개 액션 중 무작위 선택(기존)
-            # action = np.random.choice(range(self.num_action))
-
-            # ✅ [수정 후] L1이 허용한(mask=True) 액션 중에서만 무작위 선택
             if mask is not None:
-                # 마스크가 True인 인덱스(허용된 액션)만 추출
                 allowed_actions = np.where(mask)[0]
                 if len(allowed_actions) == 0:
-                    # (안전장치) 만약 L1이 모든 행동을 막았다면, 0번 행동을 선택
-                    self.logger.warning("[L1 Safety] All actions were masked! Defaulting to action 0.")
-                    action = 0
+                    # 룰 충돌 → mask 무시, 전체 action 중 랜덤 탐색
+                    self.logger.warning(
+                        "[L1 Safety] All actions masked (rule conflict)! "
+                        "Ignoring mask and selecting random action."
+                    )
+                    action = np.random.choice(range(self.num_action))
                 else:
                     action = np.random.choice(allowed_actions)
             else:
-                # L1 룰이 없으면(mask=None) 기존처럼 10개 중 무작위 선택
                 action = np.random.choice(range(self.num_action))
 
-        # 탐색 여부 결정
         if self.iteration_log:
             self.logger.info(f'action : {action} type : {action_type} epsilon : {self.epsilon:.4f}')
 
+        if return_qvals:
+            return action, self.epsilon, drl_preferred_action, drl_preferred_qval, raw_qvals
         return action, self.epsilon
 
     def update(self, batch_size):
@@ -282,6 +304,24 @@ class RainbowDQN:
         self.target_net.reset_noise()
 
         return loss.item()
+
+    def save_checkpoint(self, path: str):
+        """DQN 가중치 + 옵티마이저 상태 저장 (중간 크래시 복구용)."""
+        torch.save({
+            'act_net':    self.act_net.state_dict(),
+            'target_net': self.target_net.state_dict(),
+            'optimizer':  self.optimizer.state_dict(),
+            'frame_idx':  self.frame_idx,
+        }, path)
+
+    def load_checkpoint(self, path: str):
+        """저장된 체크포인트 복원."""
+        ckpt = torch.load(path, map_location=self.device)
+        self.act_net.load_state_dict(ckpt['act_net'])
+        self.target_net.load_state_dict(ckpt['target_net'])
+        self.optimizer.load_state_dict(ckpt['optimizer'])
+        self.frame_idx = ckpt.get('frame_idx', 0)
+        self.logger.info(f"[DQN] Checkpoint loaded from {path}")
 
 # import os
 # import sys
