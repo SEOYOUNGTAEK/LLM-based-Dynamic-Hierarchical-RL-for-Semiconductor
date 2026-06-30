@@ -43,9 +43,6 @@ paper/
 thesis/
 Paper_master/
 
-# PlantSim project file (binary, environment-specific)
-*.spp
-
 # Jupyter test notebooks
 *.ipynb
 
