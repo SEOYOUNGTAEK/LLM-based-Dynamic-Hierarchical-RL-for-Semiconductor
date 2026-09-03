@@ -22,7 +22,7 @@ from env.twin import PlantsimManager
 #   (A) Pure DRL    #
 #####################
 num_episodes = 100
-EVAL_START_EPISODE = 70   # 에피소드 71~100: 평가 전용 (학습 없음, greedy 정책)
+EVAL_START_EPISODE = 70   # episodes 71-100: evaluation only (no learning, greedy)
 RANDOM_SEED = 42
 num_actions = 10
 chart_frequency = 10
@@ -90,8 +90,12 @@ if __name__ == '__main__':
     import argparse, random as _random
     parser = argparse.ArgumentParser()
     parser.add_argument('--seed', type=int, default=RANDOM_SEED)
+    parser.add_argument('--urgent_entry_type', type=str, default='early',
+                        choices=['early', 'mid', 'late', 'mixed'],
+                        help='긴급 Lot 진입 유형: early(투입형), mid(전환형), late(막바지형), mixed(혼합형)')
     args = parser.parse_args()
     RANDOM_SEED = args.seed
+    URGENT_ENTRY_TYPE = args.urgent_entry_type
 
     _random.seed(RANDOM_SEED)
     np.random.seed(RANDOM_SEED)
@@ -99,7 +103,8 @@ if __name__ == '__main__':
     np.set_printoptions(suppress=True, precision=6)
 
     version_no = datetime.now().strftime('%Y%m%d_%H%M%S')
-    folder_name = f"output/{version_no}_PureDRL_s{RANDOM_SEED}"
+    entry_suffix = f"_{URGENT_ENTRY_TYPE}" if URGENT_ENTRY_TYPE != "early" else ""
+    folder_name = f"output/{version_no}_PureDRL{entry_suffix}_s{RANDOM_SEED}"
     log_dir = "./" + folder_name
     plot_dir = log_dir + '/plot/'
     for d in [folder_name, folder_name+"/pickle", folder_name+"/csv", folder_name+"/log", plot_dir]:
@@ -113,7 +118,7 @@ if __name__ == '__main__':
 
     logger.info("Data Generator Run Start")
     generator = Generator()
-    generator.run()
+    generator.run(urgent_entry_type=URGENT_ENTRY_TYPE)
     logger.info("Data Generator Run Complete")
 
     batch_size = 64
@@ -129,7 +134,7 @@ if __name__ == '__main__':
     plt.ion()
     fig, ax = plt.subplots(figsize=(12, 6))
 
-    # DQN: num_episodes=EVAL_START_EPISODE → epsilon이 훈련 종료 시 최솟값 도달
+    # DQN: num_episodes=EVAL_START_EPISODE so epsilon reaches its minimum by end of training
     dqn = RainbowDQN(num_state=21, num_action=num_actions,
                      num_episodes=EVAL_START_EPISODE, iteration_log=iteration_log)
     iteration_cnt = 0
@@ -189,7 +194,7 @@ if __name__ == '__main__':
                 if simTime > simulation_end_time:
                     break
 
-                # Pure DRL: 마스킹 없음, LLM 없음
+                # Pure DRL: no masking, no LLM
                 get_action_start_time = time.time()
                 action, epsilon = get_action(state, prev_epsilon, greedy=is_eval)
                 prev_epsilon = epsilon
@@ -240,7 +245,7 @@ if __name__ == '__main__':
                                 "reward_components": reward_components}
                     logger.info(f"[XRL_DATA] {json.dumps(xrl_data, cls=NumpyJSONEncoder)}")
 
-                # 훈련/평가 분기
+                # train / evaluation split
                 if not is_eval:
                     if not is_first_iteration:
                         dqn.buffer.add((state, action, reward, next_state))

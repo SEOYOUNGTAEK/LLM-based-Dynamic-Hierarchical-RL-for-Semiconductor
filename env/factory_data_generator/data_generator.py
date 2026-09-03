@@ -15,11 +15,17 @@ class Generator:
     def __init__(self):
         self.logger = Logger().get_logger()
 
-    def run(self, urgent_lot_ratio: float = None):
+    def run(self, urgent_lot_ratio: float = None, urgent_entry_type: str = "early"):
         """
-        urgent_lot_ratio: 긴급 Lot 비율 (0.0~1.0). None이면 기본값(7.7%) 사용.
+        urgent_lot_ratio  : 긴급 Lot 비율 (0.0~1.0). None이면 기본값(7.7%) 사용.
+        urgent_entry_type : 긴급 Lot 진입 유형
+            "early"  - 투입형: 공정 초기(Process 1) 투입. 기본값/현행 조건.
+            "mid"    - 전환형: 공정 중반(Process 3-4) 긴급 전환. 납기 위급 시나리오.
+            "late"   - 막바지형: 공정 후반(Process 5-6) 투입. 잔여 공정 극소 시나리오.
+            "mixed"  - 혼합형: early 절반 + late 절반. 실제 운영 혼재 시나리오.
         """
-        self.urgent_lot_ratio = urgent_lot_ratio  # None = default 7.7%
+        self.urgent_lot_ratio = urgent_lot_ratio
+        self.urgent_entry_type = urgent_entry_type
         self.client = MongoClient("mongodb://localhost:27017")
         self.db_name = "plantsim"
         self.db = self.client[self.db_name]
@@ -91,19 +97,43 @@ class Generator:
                     lot_process_id = process_id  # 기본값
                     lot_buffer = buffer  # 기본값
 
-                    # 🚨 [수정된 긴급 Lot 생성 로직]
-                    is_eligible = (device_id == "A" or device_id == "B") and (process_id == 1)
+                    # 긴급 Lot 진입 유형에 따른 eligible process 결정
+                    # "early" : process 1 (현행)
+                    # "mid"   : process 3~4
+                    # "late"  : process 5~6
+                    # "mixed" : A=early(process 1), B=late(process 5)
+                    etype = getattr(self, "urgent_entry_type", "early")
+                    if etype == "early":
+                        eligible_process = {1}
+                        urgent_proc = 1
+                    elif etype == "mid":
+                        eligible_process = {3, 4}
+                        urgent_proc = 3
+                    elif etype == "late":
+                        eligible_process = {5, 6}
+                        urgent_proc = 5
+                    elif etype == "mixed":
+                        # A → early(1), B → late(5)
+                        if device_id == "A":
+                            eligible_process = {1}
+                            urgent_proc = 1
+                        else:
+                            eligible_process = {5, 6}
+                            urgent_proc = 5
+                    else:
+                        eligible_process = {1}
+                        urgent_proc = 1
+
+                    is_eligible = (device_id == "A" or device_id == "B") and (process_id in eligible_process)
 
                     if is_eligible and urgent_lots_created_total < URGENT_LOT_GOAL_TOTAL:
 
-                        # A 제품 할당 조건 (10개 미만일 때만)
                         if device_id == "A" and urgent_a_count < URGENT_LOT_GOAL_PER_DEVICE:
                             current_priority = 1
                             urgent_a_count += 1
                             urgent_lots_created_total += 1
                             is_urgent = True
 
-                        # B 제품 할당 조건 (10개 미만일 때만)
                         elif device_id == "B" and urgent_b_count < URGENT_LOT_GOAL_PER_DEVICE:
                             current_priority = 1
                             urgent_b_count += 1
@@ -111,10 +141,12 @@ class Generator:
                             is_urgent = True
 
                         if is_urgent:
-                            # 긴급 Lot은 Process 1 (INPUT_BANK)으로 고정 투입
-                            lot_process_id = 1
-                            lot_buffer = buffers[1]
-                            self.logger.info(f"URGENT LOT CREATED: ULot{unique_id} (Prio 1) for Device {device_id}")
+                            lot_process_id = urgent_proc
+                            lot_buffer = buffers[urgent_proc]
+                            self.logger.info(
+                                f"URGENT LOT CREATED: ULot{unique_id} (Prio 1) "
+                                f"Device={device_id} entry_type={etype} proc={urgent_proc}"
+                            )
 
                     lot_id_prefix = "ULot" if is_urgent else "Lot"
 
